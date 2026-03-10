@@ -13,6 +13,8 @@ from yt_dlp import YoutubeDL
 
 # Duration of each segment in milliseconds (1 minute)
 SEGMENT_LENGTH = 60 * 1000
+# Binary search precision: 5 seconds
+BINARY_SEARCH_STEP = 5 * 1000
 
 # Directory for downloaded files
 DOWNLOADS_DIR = 'downloads'
@@ -196,14 +198,36 @@ def segment_audio(audio_file: str, output_directory: str = "tmp", num_threads: i
                 future.result()
 
     except Exception as e:
-        logger.error(f"Failed to segment audio file {audio_file}: {e}")
+        logger.debug(f"Failed to segment audio file {audio_file}: {e}")
 
 
-async def get_name(file_path: str, max_retries: int = 3) -> tuple:
+def extract_segment(audio_file: str, start_ms: int, duration_ms: int, output_path: str) -> None:
     """
-    Uses Shazam to recognize the song with retry logic and error handling.
-    Returns either ('mm:ss', 'Artist - Title') or (None, 'Not found') if it fails.
+    Extract a segment from an audio file.
     """
+    try:
+        audio = AudioSegment.from_file(audio_file, format="mp3")
+        # Handle case where start is beyond audio length
+        if start_ms >= len(audio):
+            logger.debug(f"Start position {start_ms}ms is beyond audio length {len(audio)}ms")
+            return
+        # Handle case where end is beyond audio length
+        end_ms = min(start_ms + duration_ms, len(audio))
+        segment = audio[start_ms:end_ms]
+        segment.export(output_path, format="mp3")
+        logger.debug(f"Extracted segment {start_ms}ms-{end_ms}ms to {output_path}")
+    except Exception as e:
+        logger.debug(f"Error extracting segment: {e}")
+
+
+async def recognize_segment(file_path: str, max_retries: int = 3) -> tuple:
+    """
+    Uses Shazam to recognize a segment with retry logic.
+    Returns (match_offset_ms, 'Artist - Title') or (None, 'Not found').
+    """
+    if not os.path.exists(file_path):
+        return (None, "Not found")
+    
     shazam = Shazam()
     logger.debug(f"Attempting to recognize: {file_path} (max retries: {max_retries})")
     for attempt in range(max_retries):
@@ -220,11 +244,7 @@ async def get_name(file_path: str, max_retries: int = 3) -> tuple:
 
             title = data['track']['title']
             subtitle = data['track']['subtitle']
-            
-            # Get the actual timestamp from Shazam API (when the match was found in the audio)
-            # This is the offset in milliseconds from the start of the audio segment
             match_offset = data.get('timestamp', 0)
-            
             result = f"{subtitle} - {title}"
             logger.debug(f"Recognition successful: {result} at offset {match_offset}ms")
             return (match_offset, result)
@@ -238,10 +258,94 @@ async def get_name(file_path: str, max_retries: int = 3) -> tuple:
             return (None, "Not found")
 
 
+async def get_name(file_path: str, max_retries: int = 3) -> tuple:
+    """
+    Uses Shazam to recognize the song with retry logic and error handling.
+    Returns either ('mm:ss', 'Artist - Title') or (None, 'Not found') if it fails.
+    """
+    return await recognize_segment(file_path, max_retries)
+
+
+def binary_search_start_time(audio_file: str, segment_start_ms: int, target_track: str) -> int:
+    """
+    Use binary search to find the exact start time of a track within a segment.
+    
+    Args:
+        audio_file: Path to the full audio file
+        segment_start_ms: The start of the minute segment (ms)
+        target_track: The track name to find
+    
+    Returns:
+        The estimated start time in milliseconds
+    """
+    logger.debug(f"Starting binary search for '{target_track}' from {format_time(segment_start_ms)}")
+    
+    # Binary search range: from segment_start to segment_start + SEGMENT_LENGTH
+    low = segment_start_ms
+    high = segment_start_ms + SEGMENT_LENGTH
+    
+    # Also check if the track was actually in the PREVIOUS segment
+    # Sometimes Shazam matches late, so check the boundary
+    boundary_check_ms = max(0, segment_start_ms - BINARY_SEARCH_STEP)
+    
+    # Quick check: is the track at the very beginning of the segment?
+    check_path = "tmp/binary_start.mp3"
+    extract_segment(audio_file, segment_start_ms, BINARY_SEARCH_STEP, check_path)
+    loop = asyncio.get_event_loop()
+    offset, result = loop.run_until_complete(recognize_segment(check_path))
+    
+    if result == target_track:
+        logger.debug(f"Track found at segment start {format_time(segment_start_ms)}")
+        return segment_start_ms
+    
+    # If not found at start, binary search within the segment
+    # But first, let's check if it's in the previous segment boundary
+    if segment_start_ms > 0:
+        check_path_prev = "tmp/binary_prev.mp3"
+        extract_segment(audio_file, boundary_check_ms, BINARY_SEARCH_STEP, check_path_prev)
+        offset, result = loop.run_until_complete(recognize_segment(check_path_prev))
+        if result == target_track:
+            logger.debug(f"Track found at previous boundary {format_time(boundary_check_ms)}")
+            return boundary_check_ms
+    
+    # Binary search: look for the transition point
+    # We check at BINARY_SEARCH_STEP intervals
+    while high - low > BINARY_SEARCH_STEP:
+        mid = (low + high) // 2
+        mid_rounded = (mid // BINARY_SEARCH_STEP) * BINARY_SEARCH_STEP
+        
+        check_path = f"tmp/binary_{mid_rounded}.mp3"
+        extract_segment(audio_file, mid_rounded, BINARY_SEARCH_STEP, check_path)
+        offset, result = loop.run_until_complete(recognize_segment(check_path))
+        
+        if result == target_track:
+            # Found it! The track is in this section
+            # Narrow down to find exact start
+            high = mid_rounded + BINARY_SEARCH_STEP
+            low = max(low, mid_rounded - BINARY_SEARCH_STEP)
+        else:
+            # Track not in this section, search later
+            low = mid
+    
+    # Return the earliest point where we found the track
+    # Check a few points around the result
+    for check_ms in range(max(segment_start_ms, low - BINARY_SEARCH_STEP), high + BINARY_SEARCH_STEP, BINARY_SEARCH_STEP):
+        check_path = f"tmp/binary_final_{check_ms}.mp3"
+        extract_segment(audio_file, check_ms, BINARY_SEARCH_STEP, check_path)
+        offset, result = loop.run_until_complete(recognize_segment(check_path))
+        if result == target_track:
+            logger.debug(f"Binary search found track start at {format_time(check_ms)}")
+            return check_ms
+    
+    # Fallback: return original segment start
+    logger.debug(f"Binary search inconclusive, using segment start {format_time(segment_start_ms)}")
+    return segment_start_ms
+
+
 def process_audio_file(audio_file: str, output_filename: str, file_index: int, total_files: int) -> None:
     """
     Processes a single audio file: segments it, recognizes each segment,
-    excludes duplicate tracks, and saves results.
+    uses binary search for precise timestamps, excludes consecutive duplicate tracks, and saves results.
     """
     # If there are multiple files, display the file index
     if total_files > 2:
@@ -250,7 +354,10 @@ def process_audio_file(audio_file: str, output_filename: str, file_index: int, t
         logger.info(f"\nProcessing file: {audio_file}")
     
     logger.debug(f"Starting processing for {audio_file}")
-    unique_tracks = set()
+    
+    # Track for consecutive deduplication
+    last_track = None
+    
     logger.info("1/5 🧹 Cleaning temporary files...")
     remove_files("tmp")
 
@@ -262,35 +369,52 @@ def process_audio_file(audio_file: str, output_filename: str, file_index: int, t
     total_segments = len(tmp_files)
     logger.debug(f"Found {total_segments} segments to process")
 
+    # First pass: collect all recognized tracks with rough timestamps
+    rough_results = []  # List of (segment_idx, track_name)
+    
     for idx, file_name in enumerate(tmp_files, start=1):
         segment_path = os.path.join("tmp", file_name)
         try:
             loop = asyncio.get_event_loop()
-            match_offset_ms, track_name = loop.run_until_complete(get_name(segment_path))
+            match_offset_ms, track_name = loop.run_until_complete(recognize_segment(segment_path))
 
-            # Use segment start time as timestamp (more reliable than Shazam's offset)
             timestamp_ms = (idx - 1) * SEGMENT_LENGTH
             timestamp_str = format_time(timestamp_ms)
 
-            # Build the output line: mm:ss artist - title
-            output_line = f"{timestamp_str} {track_name}" if track_name != "Not found" else track_name
-
-            # Build the progress output
-            progress_str = f"[{idx}/{total_segments}]: {output_line}"
+            progress_str = f"[{idx}/{total_segments}]: {track_name}" if track_name != "Not found" else f"[{idx}/{total_segments}]: Not found"
             logger.info(progress_str)
 
-            if track_name != "Not found" and track_name not in unique_tracks:
-                unique_tracks.add(track_name)
-                write_to_file(output_line, output_filename)
-                logger.debug(f"Added new unique track: {output_line}")
+            if track_name != "Not found":
+                rough_results.append((idx, track_name, timestamp_ms))
+                logger.debug(f"Collected: segment {idx}, track '{track_name}' at {timestamp_str}")
         except Exception as e:
-            logger.error(f"Error processing segment {file_name}: {e}")
+            logger.debug(f"Error processing segment {file_name}: {e}")
             continue
+
+    # Second pass: binary search for precise timestamps and write results
+    if rough_results:
+        logger.info("4/5 🎯 Binary searching for precise timestamps...")
+        
+        for seg_idx, track_name, rough_timestamp in rough_results:
+            # Use binary search to find precise start time
+            precise_start = binary_search_start_time(audio_file, rough_timestamp, track_name)
+            timestamp_str = format_time(precise_start)
+            
+            output_line = f"{timestamp_str} {track_name}"
+            
+            # Consecutive deduplication: skip if same as last track
+            if track_name == last_track:
+                logger.debug(f"Skipping consecutive duplicate: {track_name}")
+                continue
+            
+            last_track = track_name
+            write_to_file(output_line, output_filename)
+            logger.info(f"✅ {output_line}")
 
     logger.info("🧹 Cleaning temporary files...")
     remove_files("tmp")
     logger.info(f"✅ Successfully processed file: {audio_file}")
-    logger.debug(f"Found {len(unique_tracks)} unique tracks in {audio_file}")
+    logger.debug(f"Found {len(rough_results)} tracks in {audio_file}")
 
 
 def process_downloads() -> None:
