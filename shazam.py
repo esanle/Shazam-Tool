@@ -83,6 +83,16 @@ def remove_files(directory: str) -> None:
     logger.debug(f"Removed {file_count} files from {directory}")
 
 
+def format_time(milliseconds: int) -> str:
+    """
+    Convert milliseconds to mm:ss format.
+    """
+    total_seconds = milliseconds // 1000
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+    return f"{minutes:02d}:{seconds:02d}"
+
+
 def write_to_file(data: str, filename: str) -> None:
     """
     Appends text string to specified file if data != 'Not found'.
@@ -189,10 +199,10 @@ def segment_audio(audio_file: str, output_directory: str = "tmp", num_threads: i
         logger.error(f"Failed to segment audio file {audio_file}: {e}")
 
 
-async def get_name(file_path: str, max_retries: int = 3) -> str:
+async def get_name(file_path: str, max_retries: int = 3) -> tuple:
     """
     Uses Shazam to recognize the song with retry logic and error handling.
-    Returns either 'Artist - Track Title' or 'Not found' if it fails.
+    Returns either ('mm:ss', 'Artist - Title') or (None, 'Not found') if it fails.
     """
     shazam = Shazam()
     logger.debug(f"Attempting to recognize: {file_path} (max retries: {max_retries})")
@@ -206,13 +216,18 @@ async def get_name(file_path: str, max_retries: int = 3) -> str:
                     await asyncio.sleep(1)
                     continue
                 logger.debug("Recognition failed after all attempts")
-                return "Not found"
+                return (None, "Not found")
 
             title = data['track']['title']
             subtitle = data['track']['subtitle']
+            
+            # Get the actual timestamp from Shazam API (when the match was found in the audio)
+            # This is the offset in milliseconds from the start of the audio segment
+            match_offset = data.get('timestamp', 0)
+            
             result = f"{subtitle} - {title}"
-            logger.debug(f"Recognition successful: {result}")
-            return result
+            logger.debug(f"Recognition successful: {result} at offset {match_offset}ms")
+            return (match_offset, result)
 
         except Exception as e:
             logger.debug(f"Error in recognition attempt {attempt+1}: {str(e)}")
@@ -220,7 +235,7 @@ async def get_name(file_path: str, max_retries: int = 3) -> str:
                 await asyncio.sleep(1)
                 continue
             logger.debug("Recognition failed after all attempts due to exception")
-            return "Not found"
+            return (None, "Not found")
 
 
 def process_audio_file(audio_file: str, output_filename: str, file_index: int, total_files: int) -> None:
@@ -236,14 +251,6 @@ def process_audio_file(audio_file: str, output_filename: str, file_index: int, t
     
     logger.debug(f"Starting processing for {audio_file}")
     unique_tracks = set()
-    try:
-        with open(output_filename, "a", encoding="utf-8") as f:
-            f.write(f"===== {os.path.basename(audio_file)} ======\n")
-        logger.debug(f"Created file header for {audio_file}")
-    except OSError as e:
-        logger.error(f"Error writing header for {audio_file}: {e}")
-        return
-
     logger.info("1/5 🧹 Cleaning temporary files...")
     remove_files("tmp")
 
@@ -259,26 +266,26 @@ def process_audio_file(audio_file: str, output_filename: str, file_index: int, t
         segment_path = os.path.join("tmp", file_name)
         try:
             loop = asyncio.get_event_loop()
-            track_name = loop.run_until_complete(get_name(segment_path))
+            match_offset_ms, track_name = loop.run_until_complete(get_name(segment_path))
 
-            # Build the progress output in the desired format
-            progress_str = f"[{idx}/{total_segments}]: {track_name}"
+            # Use segment start time as timestamp (more reliable than Shazam's offset)
+            timestamp_ms = (idx - 1) * SEGMENT_LENGTH
+            timestamp_str = format_time(timestamp_ms)
+
+            # Build the output line: mm:ss artist - title
+            output_line = f"{timestamp_str} {track_name}" if track_name != "Not found" else track_name
+
+            # Build the progress output
+            progress_str = f"[{idx}/{total_segments}]: {output_line}"
             logger.info(progress_str)
 
             if track_name != "Not found" and track_name not in unique_tracks:
                 unique_tracks.add(track_name)
-                write_to_file(track_name, output_filename)
-                logger.debug(f"Added new unique track: {track_name}")
+                write_to_file(output_line, output_filename)
+                logger.debug(f"Added new unique track: {output_line}")
         except Exception as e:
             logger.error(f"Error processing segment {file_name}: {e}")
             continue
-
-    # Add an empty line after processing each file
-    try:
-        with open(output_filename, "a", encoding="utf-8") as f:
-            f.write("\n")
-    except OSError as e:
-        logger.error(f"Error writing empty line for {audio_file}: {e}")
 
     logger.info("🧹 Cleaning temporary files...")
     remove_files("tmp")
@@ -289,6 +296,7 @@ def process_audio_file(audio_file: str, output_filename: str, file_index: int, t
 def process_downloads() -> None:
     """
     Process all MP3 files in DOWNLOADS_DIR: recognize each and save results to a new file.
+    Output format: mm:ss artist - title (one per line, no headers)
     """
     output_dir = "recognised-lists"
     ensure_directory_exists(output_dir)
@@ -302,13 +310,6 @@ def process_downloads() -> None:
     timestamp = datetime.now().strftime("%d%m%y-%H%M%S")
     output_filename = os.path.join(output_dir, f"songs-{timestamp}.txt")
     logger.debug(f"Created output file: {output_filename}")
-
-    try:
-        with open(output_filename, "w", encoding="utf-8") as f:
-            f.write(f"===== Scan results for {DOWNLOADS_DIR} directory ======\n\n")
-    except OSError as e:
-        logger.error(f"Error creating output file {output_filename}: {e}")
-        return
 
     total_files = len(mp3_files)
     logger.info(f"📝 Found {total_files} MP3 file(s) to process...")
@@ -399,13 +400,6 @@ def main() -> None:
             logger.error("Missing URL. Usage: python shazam.py download <url> [--debug]")
             sys.exit(1)
 
-        try:
-            with open(output_filename, "w", encoding="utf-8") as f:
-                f.write("===== Download Results ======\n\n")
-        except OSError as e:
-            logger.error(f"Error creating output file {output_filename}: {e}")
-            sys.exit(1)
-
         download_from_url(url_or_file)
         process_downloads()
 
@@ -435,13 +429,6 @@ def main() -> None:
             # (assuming it's the one we just downloaded)
             latest_file = max([os.path.join(DOWNLOADS_DIR, f) for f in mp3_files], 
                               key=os.path.getmtime)
-            
-            try:
-                with open(output_filename, "w", encoding="utf-8") as f:
-                    f.write("===== Recognition Results ======\n\n")
-            except OSError as e:
-                logger.error(f"Error creating output file {output_filename}: {e}")
-                sys.exit(1)
                 
             process_audio_file(latest_file, output_filename, 1, 1)
             logger.info(f"\nResults saved to {output_filename}")
@@ -450,13 +437,6 @@ def main() -> None:
         # Handle local file
         if not os.path.exists(audio_file):
             logger.error(f"Error: File '{audio_file}' not found.")
-            sys.exit(1)
-
-        try:
-            with open(output_filename, "w", encoding="utf-8") as f:
-                f.write("===== Recognition Results ======\n\n")
-        except OSError as e:
-            logger.error(f"Error creating output file {output_filename}: {e}")
             sys.exit(1)
 
         # Since we're processing a single file, pass file_index=1 and total_files=1
