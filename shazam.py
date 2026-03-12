@@ -2,41 +2,36 @@ import os
 import sys
 import asyncio
 from datetime import datetime
-import subprocess
 import logging
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 
 from pydub import AudioSegment
 from shazamio import Shazam
 from yt_dlp import YoutubeDL
 
-# Duration of each segment in milliseconds (1 minute)
-SEGMENT_LENGTH = 60 * 1000
+COARSE_SEGMENT_MS = 60_000    # 1-minute segments for initial scan
+PROBE_MS = 12_000             # 12-second clips for binary search probes
+MIN_SEARCH_RANGE_MS = 15_000  # stop binary search when range <= 15s
 
-# Directory for downloaded files
 DOWNLOADS_DIR = 'downloads'
 
-# Logger setup 
 logger = logging.getLogger('shazam_tool')
 
+
 def setup_logging(debug_mode=False):
-    """
-    Configure logging based on debug mode.
-    """
     log_level = logging.DEBUG if debug_mode else logging.INFO
     log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    
+
     logger.handlers = []
     logger.setLevel(log_level)
-    
+
     ensure_directory_exists('logs')
-    
+
     file_handler = logging.FileHandler('logs/app.log')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(log_format))
     logger.addHandler(file_handler)
-    
+
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
     console_format = '%(message)s' if not debug_mode else log_format
@@ -60,8 +55,11 @@ def remove_files(directory: str) -> None:
 
 def format_time(milliseconds: int) -> str:
     total_seconds = max(0, milliseconds) // 1000
-    minutes = total_seconds // 60
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
     seconds = total_seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
 
 
@@ -118,28 +116,11 @@ def download_from_url(url: str) -> None:
         logger.error("❌ Unsupported URL format.")
 
 
-def segment_audio(audio_file: str, output_directory: str = "tmp", num_threads: int = 4) -> None:
-    ensure_directory_exists(output_directory)
-    try:
-        audio = AudioSegment.from_file(audio_file, format="mp3")
-        segments = [audio[i:i + SEGMENT_LENGTH] for i in range(0, len(audio), SEGMENT_LENGTH)]
-        
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = []
-            for idx, seg in enumerate(segments, start=1):
-                segment_file_path = os.path.join(output_directory, f"{idx}.mp3")
-                futures.append(executor.submit(seg.export, segment_file_path, format="mp3"))
-            for future in futures:
-                future.result()
-    except Exception as e:
-        logger.debug(f"Failed to segment audio file {audio_file}: {e}")
-
-
 async def recognize_segment(file_path: str, max_retries: int = 2) -> tuple:
     """Returns (match_offset_ms, 'Artist - Title') or (None, 'Not found')."""
     if not os.path.exists(file_path):
         return (None, "Not found")
-    
+
     shazam = Shazam()
     for attempt in range(max_retries):
         try:
@@ -152,91 +133,191 @@ async def recognize_segment(file_path: str, max_retries: int = 2) -> tuple:
 
             title = data['track']['title']
             subtitle = data['track']['subtitle']
-            # Shazam returns the offset within the submitted audio where match was found
-            match_offset = data.get('timestamp', 0)
-            result = f"{subtitle} - {title}"
-            return (match_offset, result)
+            match_offset = 0
+            if data.get('matches'):
+                match_offset = int(data['matches'][0].get('offset', 0) * 1000)
+            return (match_offset, f"{subtitle} - {title}")
 
-        except Exception as e:
+        except Exception:
             if attempt < max_retries - 1:
                 await asyncio.sleep(0.5)
                 continue
             return (None, "Not found")
 
 
-def process_audio_file(audio_file: str, output_filename: str, file_index: int, total_files: int) -> None:
-    """Process audio: segment → recognize → precise timestamps via Shazam offset → consecutive dedup."""
-    
+async def recognize_clip(audio: AudioSegment, start_ms: int, duration_ms: int = PROBE_MS) -> str:
+    """Extract a short clip from audio at start_ms and recognize it via Shazam.
+    Returns the track name string, or 'Not found'."""
+    end_ms = min(start_ms + duration_ms, len(audio))
+    if end_ms - start_ms < 5000:
+        return "Not found"
+    clip = audio[start_ms:end_ms]
+    probe_path = os.path.join("tmp", f"_probe_{start_ms}.mp3")
+    clip.export(probe_path, format="mp3")
+    _, track = await recognize_segment(probe_path)
+    try:
+        os.remove(probe_path)
+    except OSError:
+        pass
+    return track
+
+
+async def binary_search_transition(
+    audio: AudioSegment, left_ms: int, right_ms: int,
+    left_track: str, right_track: str,
+) -> int:
+    """Binary search to find the transition point between two tracks.
+
+    left_ms  — a position where left_track is known to be playing
+    right_ms — a position where right_track is known to be playing
+
+    Returns estimated start time (ms) of right_track, accurate to ~15s.
+    """
+    best_boundary = right_ms
+
+    for iteration in range(8):
+        if right_ms - left_ms <= MIN_SEARCH_RANGE_MS:
+            break
+
+        mid_ms = (left_ms + right_ms) // 2
+        result = await recognize_clip(audio, mid_ms)
+        logger.debug(f"    Binary #{iteration + 1}: {format_time(mid_ms)} → {result}")
+
+        if result == right_track:
+            best_boundary = mid_ms
+            right_ms = mid_ms
+        elif result == left_track:
+            left_ms = mid_ms + PROBE_MS
+        else:
+            # Unknown / mixing zone — try a second probe slightly ahead
+            alt_ms = mid_ms + PROBE_MS
+            if alt_ms < right_ms:
+                alt_result = await recognize_clip(audio, alt_ms)
+                logger.debug(f"    Binary #{iteration + 1}b: {format_time(alt_ms)} → {alt_result}")
+                if alt_result == right_track:
+                    best_boundary = alt_ms
+                    right_ms = alt_ms
+                elif alt_result == left_track:
+                    left_ms = alt_ms + PROBE_MS
+                else:
+                    best_boundary = mid_ms
+                    break
+            else:
+                best_boundary = mid_ms
+                break
+
+    return best_boundary
+
+
+async def _process_audio_async(
+    audio_file: str, output_filename: str, file_index: int, total_files: int,
+) -> None:
     if total_files > 1:
         logger.info(f"\n[{file_index}/{total_files}] Processing: {audio_file}")
     else:
         logger.info(f"\nProcessing: {audio_file}")
-    
-    # Get audio duration for accurate timestamps
-    try:
-        audio = AudioSegment.from_file(audio_file, format="mp3")
-        audio_duration_ms = len(audio)
-    except:
-        audio_duration_ms = 0
-    
-    last_track = None
-    logger.info("1/4 🧹 Cleaning temporary files...")
+
+    logger.info("1/4 📂 Loading audio...")
+    audio = AudioSegment.from_file(audio_file, format="mp3")
+    duration_ms = len(audio)
+    logger.info(f"    Duration: {format_time(duration_ms)}")
+
+    ensure_directory_exists("tmp")
     remove_files("tmp")
 
-    logger.info("2/4 ✂️ Segmenting audio file...")
-    segment_audio(audio_file, "tmp")
+    # ── Phase 1: Coarse scan (60s segments) ──────────────────────────
+    logger.info("2/4 🔍 Coarse scan (60s segments)...")
+    num_segments = (duration_ms + COARSE_SEGMENT_MS - 1) // COARSE_SEGMENT_MS
+    coarse_results = []
 
-    logger.info("3/4 🔍 Recognizing segments...")
-    tmp_files = sorted(os.listdir("tmp"), key=lambda x: int(os.path.splitext(x)[0]))
-    total_segments = len(tmp_files)
-    
-    results = []  # List of (absolute_timestamp_ms, track_name)
-
-    for idx, file_name in enumerate(tmp_files, start=1):
-        segment_path = os.path.join("tmp", file_name)
+    for i in range(num_segments):
+        start_ms = i * COARSE_SEGMENT_MS
+        end_ms = min(start_ms + COARSE_SEGMENT_MS, duration_ms)
+        segment = audio[start_ms:end_ms]
+        seg_path = os.path.join("tmp", f"coarse_{i}.mp3")
+        segment.export(seg_path, format="mp3")
+        _, track = await recognize_segment(seg_path)
+        coarse_results.append((start_ms, track))
+        icon = "❌" if track == "Not found" else "✅"
+        logger.info(f"  [{i + 1}/{num_segments}] {format_time(start_ms)} {icon} {track}")
         try:
-            loop = asyncio.get_event_loop()
-            match_offset_ms, track_name = loop.run_until_complete(recognize_segment(segment_path))
-            
-            if track_name == "Not found":
-                logger.info(f"[{idx}/{total_segments}]: Not found")
-                continue
-            
-            # Calculate absolute timestamp: segment start + Shazam's offset within segment
-            segment_start_ms = (idx - 1) * SEGMENT_LENGTH
-            
-            # Shazam's offset is within the submitted 10-second sample, not the full segment
-            # We add it to get the more precise timestamp
-            absolute_timestamp_ms = segment_start_ms + match_offset_ms
-            
-            # Ensure we don't exceed audio length
-            if audio_duration_ms > 0:
-                absolute_timestamp_ms = min(absolute_timestamp_ms, audio_duration_ms)
-            
-            results.append((absolute_timestamp_ms, track_name))
-            logger.info(f"[{idx}/{total_segments}]: {format_time(absolute_timestamp_ms)} {track_name}")
-            
-        except Exception as e:
-            logger.debug(f"Error processing segment {file_name}: {e}")
-            continue
+            os.remove(seg_path)
+        except OSError:
+            pass
 
-    # 4th pass: Write results with consecutive deduplication
-    logger.info("4/4 💾 Writing results (with consecutive dedup)...")
-    
-    for timestamp_ms, track_name in results:
-        # Skip if same as previous track (consecutive dedup)
-        if track_name == last_track:
-            logger.debug(f"Skipping consecutive duplicate: {track_name}")
+    # ── Phase 2: Build track runs (consecutive dedup, skip Not found) ─
+    # Each run: (first_segment_start_ms, last_segment_start_ms, track_name)
+    track_runs = []
+    for start_ms, track in coarse_results:
+        if track == "Not found":
             continue
-        
-        last_track = track_name
-        timestamp_str = format_time(timestamp_ms)
-        output_line = f"{timestamp_str} {track_name}"
-        write_to_file(output_line, output_filename)
-        logger.info(f"✅ {output_line}")
+        if track_runs and track_runs[-1][2] == track:
+            track_runs[-1] = (track_runs[-1][0], start_ms, track)
+        else:
+            track_runs.append((start_ms, start_ms, track))
+
+    if not track_runs:
+        logger.warning("❌ No tracks identified!")
+        remove_files("tmp")
+        return
+
+    logger.info(f"    Identified {len(track_runs)} unique track(s)")
+
+    # ── Phase 3: Binary search to refine each boundary ───────────────
+    logger.info("3/4 🎯 Refining boundaries (binary search, ~12s probes)...")
+    refined = []
+
+    for i, (first_ms, last_ms, track) in enumerate(track_runs):
+        if i == 0:
+            if first_ms == 0:
+                refined.append((0, track))
+                logger.info(f"  Track 1: {track} @ 00:00")
+            else:
+                boundary = await binary_search_transition(
+                    audio, 0, first_ms + COARSE_SEGMENT_MS, "Not found", track,
+                )
+                refined.append((boundary, track))
+                logger.info(f"  Track 1: {track} @ {format_time(boundary)}")
+        else:
+            prev_first, prev_last, prev_track = track_runs[i - 1]
+            search_left = prev_last
+            search_right = min(first_ms + COARSE_SEGMENT_MS, duration_ms)
+
+            logger.info(f"  Boundary: {prev_track} → {track}")
+            logger.info(f"    Search range: {format_time(search_left)} – {format_time(search_right)}")
+
+            boundary = await binary_search_transition(
+                audio, search_left, search_right, prev_track, track,
+            )
+            refined.append((boundary, track))
+            logger.info(f"  Track {i + 1}: {track} @ {format_time(boundary)}")
+
+    # ── Phase 4: Write results ───────────────────────────────────────
+    logger.info("4/4 💾 Writing results...")
+    for timestamp_ms, track in refined:
+        ts = format_time(timestamp_ms)
+        line = f"{ts} {track}"
+        write_to_file(line, output_filename)
+        logger.info(f"  ✅ {line}")
 
     remove_files("tmp")
-    logger.info(f"✅ Done! Found {len(results)} tracks (after dedup)")
+    logger.info(f"✨ Done! {len(refined)} tracks with ~10-15s timestamp precision")
+
+
+def process_audio_file(
+    audio_file: str, output_filename: str, file_index: int, total_files: int,
+) -> None:
+    """Process audio: coarse 60s scan → binary search refinement → precise tracklist."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    loop.run_until_complete(
+        _process_audio_async(audio_file, output_filename, file_index, total_files)
+    )
 
 
 def process_downloads() -> None:
@@ -252,7 +333,7 @@ def process_downloads() -> None:
 
     timestamp = datetime.now().strftime("%d%m%y-%H%M%S")
     output_filename = os.path.join(output_dir, f"songs-{timestamp}.txt")
-    
+
     total_files = len(mp3_files)
     logger.info(f"📝 Found {total_files} MP3 file(s) to process...")
     logger.info("🚀 Starting processing...")
@@ -277,7 +358,7 @@ Commands:
     recognize <file> Recognize specific file
 
 Options:
-    --debug        Enable debug logging
+    --debug        Enable debug logging (shows binary search steps)
     """)
 
 
@@ -286,22 +367,21 @@ def main():
     parser.add_argument('command', nargs='?', help='scan, download, or recognize')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('url_or_file', nargs='?', help='URL or file path')
-    
+
     args, unknown = parser.parse_known_args()
-    
+
     if not args.command:
         print_usage()
         sys.exit(1)
-    
+
     setup_logging(args.debug)
-    
+
     command = args.command
     output_dir = "recognised-lists"
     ensure_directory_exists(output_dir)
     timestamp = datetime.now().strftime("%d%m%y-%H%M%S")
     output_filename = os.path.join(output_dir, f"songs-{timestamp}.txt")
 
-    # Handle URL/file arguments
     if command in ['download', 'recognize']:
         start_idx = 2
         if '--debug' in sys.argv:
@@ -319,12 +399,12 @@ def main():
 
     elif command in ['scan', 'scan-downloads']:
         process_downloads()
-    
+
     elif command == 'recognize':
         if not url_or_file:
             logger.error("Missing file path.")
             sys.exit(1)
-        
+
         audio_file = url_or_file
         if audio_file.startswith('http://') or audio_file.startswith('https://'):
             download_from_url(audio_file)
@@ -338,7 +418,7 @@ def main():
                 logger.error(f"File not found: {audio_file}")
                 sys.exit(1)
             process_audio_file(audio_file, output_filename, 1, 1)
-        
+
         logger.info(f"\nResults saved to {output_filename}")
 
     else:
