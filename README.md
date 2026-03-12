@@ -1,119 +1,102 @@
-# 🎵 Shazam Tool
+# Shazam Tool
 
-> 🔍 A Python script that downloads audio from SoundCloud or YouTube, splits it into segments, and uses Shazam to identify songs within the mix.
+Identify every track in a DJ mix — automatically.
 
-## ✨ Features
+Paste a YouTube or SoundCloud link, get a timestamped tracklist ready to drop in the comments. Built for the tracklist culture: the people who ID every song in a Boiler Room set, festival recordings, or radio shows so everyone can find that one track they fell in love with at 1:37:00.
 
-- 🎧 Download audio from SoundCloud or YouTube URLs
-- 🎼 Identify songs using Shazam API
-- 💾 Save results to timestamped text files
-- 🚀 Easy setup and usage with provided shell script
+## How It Works
 
-## 🛠️ Requirements
+1. **Coarse scan** — splits audio into 60-second segments and identifies each via Shazam
+2. **Binary search refinement** — narrows down track transition points to ~10–15 second accuracy
+3. **Deduplication** — consecutive duplicate detections are merged into single entries
 
-This project uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) for downloading audio from SoundCloud and YouTube.
+## Requirements
 
-### Linux
-
-```sh
-sudo apt install ffmpeg
-pip install ShazamApi pydub yt-dlp shazamio
-```
+- Python 3.11+
+- ffmpeg
 
 ### macOS
 
 ```sh
-# Install Homebrew if not already installed
-# See https://brew.sh for installation instructions
-
-brew install ffmpeg
-
-# Optional: Create and activate virtual environment
-# python3.11 -m venv venv && source venv/bin/activate
-
-# If you don't have Python 3.11:
-# brew install python@3.11
-
-# Install required packages
-pip install shazamio pydub yt-dlp ShazamApi
+brew install ffmpeg python@3.12
 ```
 
-## 📚 Usage
-
-### Quick Start (Recommended)
-
-Use the provided shell script for easy setup and running:
+### Linux
 
 ```sh
-# Make the script executable (if needed)
-chmod +x run_shazam.sh
+sudo apt install ffmpeg python3
+```
 
-# Setup environment (installs dependencies, creates venv)
-./run_shazam.sh setup
+### Python dependencies
 
-# Download and process audio from URL
-./run_shazam.sh download <url>
+```sh
+pip install shazamio pydub yt-dlp
+```
 
-# Process all downloaded files
-./run_shazam.sh scan
+## Usage
 
-# Process a specific audio file
-./run_shazam.sh recognize <file>
+### Shell script (recommended)
 
-# Show help information
+```sh
+./run_shazam.sh setup              # create venv, install deps
+./run_shazam.sh download <url>     # download + identify
+./run_shazam.sh scan               # identify all files in downloads/
+./run_shazam.sh recognize <file>   # identify a single file
 ./run_shazam.sh help
 ```
 
-### Manual Usage
-
-The script also supports direct Python invocation with three main commands:
-
-#### 1. Download and Process from URL
+### Direct Python
 
 ```sh
-python shazam.py download <url>
+python shazam.py download <url>       # download from YouTube/SoundCloud + identify
+python shazam.py scan                 # identify all MP3s in downloads/
+python shazam.py recognize <file>     # identify a single local file
+python shazam.py recognize <url>      # download then identify a single file
+python shazam.py recognize <file> --debug   # verbose output (shows binary search steps)
 ```
 
-Downloads audio from YouTube or SoundCloud and processes it for song recognition.
+The `--debug` flag works with any command and logs binary search probes and segment details.
 
-#### 2. Scan Downloaded Files
+## Output
 
-```sh
-python shazam.py scan
-```
-
-Processes all MP3 files in the Downloads directory.
-
-#### 3. Recognize Single File
-
-```sh
-python shazam.py recognize <file>
-```
-
-Processes a single audio file for song recognition.
-
-## 📋 Output
-
-Results are saved in the `recognised-lists` directory with timestamped filenames in the format:
+Results are saved to `recognised-lists/songs-DDMMYY-HHMMSS.txt` — timestamps are YouTube-comment ready (clickable when pasted):
 
 ```
-songs-DDMMYY-HHMMSS.txt
+00:00 Karl Jenkins - Adiemus
+01:30 Paperclip People - Throw (Slam's RTM Remix)
+02:15 Richard Ulh - Bumping
+04:24 Boogietraxx & Milton Shadow - The Hearing Test
+08:00 Blaze & Bicep - Lovelee Dae (Bicep Remix)
 ```
 
-> ℹ️ The generated song list can be imported into [TuneMyMusic](https://www.tunemymusic.com/)
+Copy-paste directly into a YouTube comment and the timestamps become clickable links.
 
-## 📝 Notes
+You can also import the tracklist into [TuneMyMusic](https://www.tunemymusic.com/) to create a playlist on Spotify, Apple Music, etc.
 
-- The script splits audio into 1-minute segments for optimal recognition
-- Duplicate songs within the same mix are automatically filtered out
-- Large files are processed in chunks to manage memory efficiently
+## Project Structure
 
-## 🤝 Contributing
+```
+shazam.py            # main script
+run_shazam.sh        # convenience wrapper
+downloads/           # downloaded audio (gitignored)
+recognised-lists/    # output tracklists (gitignored)
+logs/                # app.log for debugging (gitignored)
+tmp/                 # temporary segments during processing (auto-cleaned)
+```
 
-Feel free to open issues or submit pull requests with improvements. We welcome contributions from the community!
+## Why This Exists
 
----
+You know when you're deep in a 3-hour festival set on YouTube and a track hits so hard you *need* to know what it is? You scroll to the comments hoping someone posted a tracklist... and nobody did.
 
-<div align="center">
-  <sub>Built with ❤️ </sub>
-</div>
+This tool is for those moments. Point it at the video, let it run, and post the tracklist yourself. Be the hero in the comments.
+
+Works great with:
+- Boiler Room sets
+- Festival recordings (Tomorrowland, Cercle, etc.)
+- SoundCloud DJ mixes
+- Radio show recordings (BBC Radio 1, Rinse FM, etc.)
+- Any long-form audio with multiple tracks
+
+## Contributing
+
+Issues and PRs welcome.
